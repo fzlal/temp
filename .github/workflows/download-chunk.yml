@@ -1,0 +1,159 @@
+name: 📥 Partial Downloader (Chunk-Based)
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: '🔗 File URL to download'
+        required: true
+        type: string
+      output_name:
+        description: '📁 Output file name (Optional - otherwise extracted from URL)'
+        required: false
+        type: string
+      chunk_size:
+        description: '📦 Chunk size for each part (e.g., 4G, 500M, 1G)'
+        required: true
+        default: '4G'
+        type: string
+      part_number:
+        description: '🔢 Which part to download? (1, 2, 3, ...)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  partial-download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🗂️ Create downloads directory
+        run: mkdir -p downloads
+
+      - name: 📝 Extract filename from URL or use input
+        id: filenames
+        run: |
+          if [ -n "${{ inputs.output_name }}" ]; then
+            ORIGINAL_FILENAME="${{ inputs.output_name }}"
+          else
+            BASENAME=$(basename "${{ inputs.download_url }}" | sed 's/?.*//')
+            ORIGINAL_FILENAME="$BASENAME"
+          fi
+          ORIGINAL_FILENAME=$(echo "$ORIGINAL_FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          echo "original_filename=$ORIGINAL_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: 🔍 Get total file size from server
+        id: get_size
+        run: |
+          TOTAL_SIZE=$(curl -sI "${{ inputs.download_url }}" | grep -i "content-length" | tail -1 | awk '{print $2}' | tr -d '\r')
+          if [ -z "$TOTAL_SIZE" ] || [ "$TOTAL_SIZE" = "" ]; then
+            echo "❌ Server didn't provide Content-Length header. Can't do partial download."
+            exit 1
+          fi
+          echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+          echo "📊 Total file size: $TOTAL_SIZE bytes ($(($TOTAL_SIZE / 1024 / 1024 / 1024)) GB)"
+
+      - name: 🧮 Calculate byte range for requested part
+        id: calculate_range
+        run: |
+          CHUNK_SIZE_RAW="${{ inputs.chunk_size }}"
+          PART_NUM="${{ inputs.part_number }}"
+          TOTAL_SIZE=${{ steps.get_size.outputs.total_size }}
+          
+          # Convert chunk size to bytes
+          CHUNK_SIZE_NUM=$(echo "$CHUNK_SIZE_RAW" | sed 's/[^0-9]//g')
+          CHUNK_SIZE_UNIT=$(echo "$CHUNK_SIZE_RAW" | sed 's/[0-9]//g' | tr '[:lower:]' '[:upper:]')
+          
+          case $CHUNK_SIZE_UNIT in
+            G) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024 * 1024 * 1024)) ;;
+            M) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024 * 1024)) ;;
+            K) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024)) ;;
+            B) CHUNK_SIZE_BYTES=$CHUNK_SIZE_NUM ;;
+            *) 
+              echo "❌ Invalid chunk size format. Use e.g., 4G, 500M, 1G"
+              exit 1
+              ;;
+          esac
+          
+          # Calculate start and end bytes
+          START_BYTE=$(( (PART_NUM - 1) * CHUNK_SIZE_BYTES ))
+          END_BYTE=$(( PART_NUM * CHUNK_SIZE_BYTES - 1 ))
+          
+          # Check if requested part is out of range
+          if [ $START_BYTE -ge $TOTAL_SIZE ]; then
+            echo "❌ Part $PART_NUM starts at byte $START_BYTE but file only has $TOTAL_SIZE bytes"
+            echo "Maximum part number for ${CHUNK_SIZE_RAW} chunks is: $(( (TOTAL_SIZE + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES ))"
+            exit 1
+          fi
+          
+          # Adjust last part if it exceeds file size
+          if [ $END_BYTE -ge $TOTAL_SIZE ]; then
+            END_BYTE=$(( TOTAL_SIZE - 1 ))
+          fi
+          
+          CHUNK_ACTUAL_SIZE=$(( END_BYTE - START_BYTE + 1 ))
+          
+          echo "start_byte=$START_BYTE" >> $GITHUB_OUTPUT
+          echo "end_byte=$END_BYTE" >> $GITHUB_OUTPUT
+          echo "chunk_actual_size=$CHUNK_ACTUAL_SIZE" >> $GITHUB_OUTPUT
+          
+          TOTAL_CHUNKS=$(( (TOTAL_SIZE + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES ))
+          
+          echo "📦 Chunk size: $CHUNK_SIZE_RAW ($CHUNK_SIZE_BYTES bytes)"
+          echo "🎯 Part $PART_NUM of $TOTAL_CHUNKS"
+          echo "📍 Byte range: $START_BYTE - $END_BYTE"
+          echo "💾 Size to download: $CHUNK_ACTUAL_SIZE bytes ($((CHUNK_ACTUAL_SIZE / 1024 / 1024)) MB)"
+
+      - name: ⬇️ Download ONLY the requested byte range
+        id: download
+        run: |
+          START=${{ steps.calculate_range.outputs.start_byte }}
+          END=${{ steps.calculate_range.outputs.end_byte }}
+          PART_NUM="${{ inputs.part_number }}"
+          TOTAL_CHUNKS=$(( ($(curl -sI "${{ inputs.download_url }}" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r') + ${{ steps.calculate_range.outputs.chunk_actual_size }} - 1) / ${{ steps.calculate_range.outputs.chunk_actual_size }} ))
+          
+          echo "📥 Downloading bytes $START to $END only..."
+          
+          curl -L --retry 3 \
+            -H "Range: bytes=$START-$END" \
+            "${{ inputs.download_url }}" \
+            -o "downloaded_part"
+          
+          ACTUAL_SIZE=$(stat -c%s "downloaded_part")
+          EXPECTED_SIZE=${{ steps.calculate_range.outputs.chunk_actual_size }}
+          
+          if [ "$ACTUAL_SIZE" -ne "$EXPECTED_SIZE" ]; then
+            echo "⚠️ Warning: Downloaded $ACTUAL_SIZE bytes but expected $EXPECTED_SIZE bytes"
+          fi
+          
+          echo "✅ Successfully downloaded $ACTUAL_SIZE bytes"
+          echo "file_size=$ACTUAL_SIZE" >> $GITHUB_OUTPUT
+
+      - name: 💾 Save file with part number in name
+        run: |
+          ORIG_NAME="${{ steps.filenames.outputs.original_filename }}"
+          PART_NUM="${{ inputs.part_number }}"
+          TOTAL_CHUNKS=$(( ($(curl -sI "${{ inputs.download_url }}" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r') + ${{ steps.calculate_range.outputs.chunk_actual_size }} - 1) / ${{ steps.calculate_range.outputs.chunk_actual_size }} ))
+          
+          FINAL_NAME="downloads/${ORIG_NAME}.part${PART_NUM}_of_${TOTAL_CHUNKS}"
+          mv downloaded_part "$FINAL_NAME"
+          
+          echo "✅ Saved as: $FINAL_NAME"
+          
+          # Show file info
+          ls -lh "$FINAL_NAME"
+
+      - name: 📦 Commit and push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add downloads/
+          git commit -m "📥 Part ${{ inputs.part_number }} of ${{ steps.filenames.outputs.original_filename }} (${{ inputs.chunk_size }} chunks)" || echo "Nothing to commit"
+          git push
