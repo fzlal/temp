@@ -12,19 +12,9 @@ on:
         required: false
         type: string
       part_size:
-        description: '✂️ Part size for splitting AFTER download (e.g., 49M, 100M)'
+        description: '✂️ Part size (e.g., 49M, 100M)'
         required: false
         default: '49M'
-        type: string
-      download_chunk_size:
-        description: '📦 Chunk size for partial download (e.g., 4G, 500M) - leave empty to download full file'
-        required: false
-        default: '4G'
-        type: string
-      download_part_number:
-        description: '🔢 Which chunk to download? (1, 2, 3, ... or "all") - Only works with download_chunk_size'
-        required: false
-        default: 'all'
         type: string
 
 permissions:
@@ -58,106 +48,14 @@ jobs:
           echo "folder_name=$FOLDER_NAME" >> $GITHUB_OUTPUT
           echo "original_filename=$ORIGINAL_FILENAME" >> $GITHUB_OUTPUT
 
-      - name: 🔍 Get total file size (for partial download)
-        id: get_size
-        run: |
-          TOTAL_SIZE=$(curl -sI "${{ inputs.download_url }}" | grep -i "content-length" | tail -1 | awk '{print $2}' | tr -d '\r')
-          if [ -z "$TOTAL_SIZE" ]; then
-            TOTAL_SIZE=0
-          fi
-          echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
-          echo "📊 Total file size: $TOTAL_SIZE bytes"
-
-      - name: 🧮 Calculate chunk ranges
-        id: ranges
-        run: |
-          CHUNK_SIZE_RAW="${{ inputs.download_chunk_size }}"
-          PART_NUMBER="${{ inputs.download_part_number }}"
-          TOTAL_SIZE=${{ steps.get_size.outputs.total_size }}
-          
-          # Parse chunk size to bytes
-          CHUNK_SIZE_NUM=$(echo "$CHUNK_SIZE_RAW" | sed 's/[^0-9]//g')
-          CHUNK_SIZE_UNIT=$(echo "$CHUNK_SIZE_RAW" | sed 's/[0-9]//g' | tr '[:lower:]' '[:upper:]')
-          
-          case $CHUNK_SIZE_UNIT in
-            G) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024 * 1024 * 1024)) ;;
-            M) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024 * 1024)) ;;
-            K) CHUNK_SIZE_BYTES=$((CHUNK_SIZE_NUM * 1024)) ;;
-            B|"") CHUNK_SIZE_BYTES=$CHUNK_SIZE_NUM ;;
-            *) CHUNK_SIZE_BYTES=$CHUNK_SIZE_NUM ;;
-          esac
-          
-          # Calculate number of chunks needed
-          if [ $TOTAL_SIZE -gt 0 ]; then
-            TOTAL_CHUNKS=$(( (TOTAL_SIZE + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES ))
-          else
-            TOTAL_CHUNKS=1
-          fi
-          
-          echo "chunk_size_bytes=$CHUNK_SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "total_chunks=$TOTAL_CHUNKS" >> $GITHUB_OUTPUT
-          
-          # Calculate range for specific part
-          if [ "$PART_NUMBER" != "all" ] && [ -n "$CHUNK_SIZE_RAW" ] && [ $TOTAL_SIZE -gt 0 ]; then
-            START_BYTE=$(( (PART_NUMBER - 1) * CHUNK_SIZE_BYTES ))
-            END_BYTE=$(( PART_NUMBER * CHUNK_SIZE_BYTES - 1 ))
-            if [ $END_BYTE -ge $TOTAL_SIZE ]; then
-              END_BYTE=$(( TOTAL_SIZE - 1 ))
-            fi
-            echo "start_byte=$START_BYTE" >> $GITHUB_OUTPUT
-            echo "end_byte=$END_BYTE" >> $GITHUB_OUTPUT
-            echo "is_partial=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_partial=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: ⬇️ Download file (full or partial)
+      - name: ⬇️ Download file
         id: download
         run: |
-          if [ "${{ steps.ranges.outputs.is_partial }}" == "true" ]; then
-            START=${{ steps.ranges.outputs.start_byte }}
-            END=${{ steps.ranges.outputs.end_byte }}
-            TOTAL_SIZE=${{ steps.get_size.outputs.total_size }}
-            CHUNK_SIZE="${{ inputs.download_chunk_size }}"
-            PART_NUM="${{ inputs.download_part_number }}"
-            TOTAL_CHUNKS=${{ steps.ranges.outputs.total_chunks }}
-            
-            echo "📥 Downloading PART $PART_NUM of $TOTAL_CHUNKS (${CHUNK_SIZE} chunks)"
-            echo "📊 Range: $START - $END (size: $((END - START + 1)) bytes)"
-            
-            curl -L --retry 3 \
-              -H "Range: bytes=$START-$END" \
-              "${{ inputs.download_url }}" \
-              -o "temp_downloaded_file"
-            
-            ACTUAL_SIZE=$(stat -c%s "temp_downloaded_file")
-            echo "✅ Downloaded $ACTUAL_SIZE bytes"
-            echo "file_size=$ACTUAL_SIZE" >> $GITHUB_OUTPUT
-            echo "is_partial=true" >> $GITHUB_OUTPUT
-            echo "downloaded_part=$PART_NUM" >> $GITHUB_OUTPUT
-          else
-            echo "📥 Downloading FULL file"
-            curl -L --retry 3 "${{ inputs.download_url }}" -o "temp_downloaded_file"
-            FILE_SIZE=$(stat -c%s "temp_downloaded_file")
-            echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
-            echo "is_partial=false" >> $GITHUB_OUTPUT
-          fi
+          curl -L --retry 3 "${{ inputs.download_url }}" -o "temp_downloaded_file"
+          FILE_SIZE=$(stat -c%s "temp_downloaded_file")
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
 
-      - name: 🏷️ Generate output filename (with part suffix if partial)
-        id: output_name
-        run: |
-          if [ "${{ steps.download.outputs.is_partial }}" == "true" ]; then
-            PART_NUM=${{ steps.download.outputs.downloaded_part }}
-            TOTAL_CHUNKS=${{ steps.ranges.outputs.total_chunks }}
-            BASE_NAME="${{ steps.filenames.outputs.original_filename }}"
-            EXTRA_SUFFIX="_part${PART_NUM}_of_${TOTAL_CHUNKS}"
-            FINAL_FILENAME="${BASE_NAME}${EXTRA_SUFFIX}"
-          else
-            FINAL_FILENAME="${{ steps.filenames.outputs.original_filename }}"
-          fi
-          echo "final_filename=$FINAL_FILENAME" >> $GITHUB_OUTPUT
-
-      - name: 🧠 Check file size vs part size (for splitting AFTER download)
+      - name: 🧠 Check file size vs part size
         id: check
         run: |
           PART_SIZE_NUM=$(echo "${{ inputs.part_size }}" | sed 's/[^0-9]//g')
@@ -169,46 +67,50 @@ jobs:
             *) PART_SIZE_BYTES=$PART_SIZE_NUM ;;
           esac
           echo "part_size_bytes=$PART_SIZE_BYTES" >> $GITHUB_OUTPUT
-          
-          FILE_SIZE=${{ steps.download.outputs.file_size }}
-          if [ $FILE_SIZE -lt $PART_SIZE_BYTES ]; then
+          if [ ${{ steps.download.outputs.file_size }} -lt $PART_SIZE_BYTES ]; then
             echo "should_split=false" >> $GITHUB_OUTPUT
           else
             echo "should_split=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: 🚀 Upload directly (no split after download)
+      - name: 🚀 Upload directly (no split, no folder)
         if: steps.check.outputs.should_split == 'false'
         run: |
-          TARGET_FILE="downloads/${{ steps.output_name.outputs.final_filename }}"
+          TARGET_FILE="downloads/${{ steps.filenames.outputs.original_filename }}"
           mv temp_downloaded_file "$TARGET_FILE"
-          
-          if [ "${{ steps.download.outputs.is_partial }}" == "true" ]; then
-            echo "✅ Partial chunk downloaded (Part ${{ steps.download.outputs.downloaded_part }}) - saved as: $TARGET_FILE"
-          else
-            echo "✅ Full file downloaded - saved as: $TARGET_FILE"
-          fi
+          echo "✅ File size (${{ steps.download.outputs.file_size }} bytes) is less than part size (${{ steps.check.outputs.part_size_bytes }} bytes). Uploaded directly to downloads/ without splitting."
 
-      - name: ✂️ Split downloaded file into smaller parts (for storage)
+      - name: ✂️ Split file into parts (only when needed)
         if: steps.check.outputs.should_split == 'true'
         run: |
-          TARGET="downloads/${{ steps.output_name.outputs.final_filename }}_split"
+          TARGET="downloads/${{ steps.filenames.outputs.folder_name }}"
           rm -rf "$TARGET"
           mkdir -p "$TARGET"
           split -b "${{ inputs.part_size }}" -d -a 3 temp_downloaded_file "$TARGET/part_"
           rm -f temp_downloaded_file
-          
-          # Move the reassembly scripts into the split folder
-          cat > "$TARGET/reassemble.sh" << 'EOF'
+
+      - name: 📜 Generate reassembly scripts (only when split)
+        if: steps.check.outputs.should_split == 'true'
+        run: |
+          TARGET_DIR="downloads/${{ steps.filenames.outputs.folder_name }}"
+          ORIG_NAME="${{ steps.filenames.outputs.original_filename }}"
+
+          # ---- Linux bash script ----
+          cat > "$TARGET_DIR/reassemble.sh" << 'EOF'
           #!/bin/bash
+          # 🔧 Reassemble parts back to original file
           PARTS_DIR="$(cd "$(dirname "$0")" && pwd)"
           OUTPUT_FILE="${PARTS_DIR}/ORIG_NAME_PLACEHOLDER"
           echo "🔄 Reassembling parts into: $OUTPUT_FILE"
           cat "${PARTS_DIR}"/part_* > "$OUTPUT_FILE"
           echo "✅ Done. File size: $(stat -c%s "$OUTPUT_FILE") bytes"
           EOF
-          
-          cat > "$TARGET/reassemble.ps1" << 'EOF'
+          sed -i "s/ORIG_NAME_PLACEHOLDER/$ORIG_NAME/g" "$TARGET_DIR/reassemble.sh"
+          chmod +x "$TARGET_DIR/reassemble.sh"
+
+          # ---- Windows PowerShell script ----
+          cat > "$TARGET_DIR/reassemble.ps1" << 'EOF'
+          # 🔧 Reassemble parts back to original file
           $partsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
           $outputFile = Join-Path $partsDir "ORIG_NAME_PLACEHOLDER"
           Write-Host "🔄 Reassembling parts into: $outputFile"
@@ -221,10 +123,7 @@ jobs:
           $fileStream.Close()
           Write-Host "✅ Done. File size: $((Get-Item $outputFile).Length) bytes"
           EOF
-          
-          sed -i "s/ORIG_NAME_PLACEHOLDER/${{ steps.output_name.outputs.final_filename }}/g" "$TARGET/reassemble.sh"
-          sed -i "s/ORIG_NAME_PLACEHOLDER/${{ steps.output_name.outputs.final_filename }}/g" "$TARGET/reassemble.ps1"
-          chmod +x "$TARGET/reassemble.sh"
+          sed -i "s/ORIG_NAME_PLACEHOLDER/$ORIG_NAME/g" "$TARGET_DIR/reassemble.ps1"
 
       - name: 📦 Commit and push changes
         run: |
@@ -232,13 +131,11 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           if [ "${{ steps.check.outputs.should_split }}" == "true" ]; then
-            TARGET_DIR="downloads/${{ steps.output_name.outputs.final_filename }}_split"
+            TARGET_DIR="downloads/${{ steps.filenames.outputs.folder_name }}"
             git add "$TARGET_DIR"
-            COMMIT_MSG="✂️ Split: ${{ steps.output_name.outputs.final_filename }} (post-download split into ${{ inputs.part_size }} parts)"
+            git commit -m "✂️ Add split parts for ${{ steps.filenames.outputs.original_filename }} (size ${{ inputs.part_size }} parts)" || echo "Nothing to commit"
           else
-            git add "downloads/${{ steps.output_name.outputs.final_filename }}"
-            COMMIT_MSG="📄 Add: ${{ steps.output_name.outputs.final_filename }}"
+            git add "downloads/${{ steps.filenames.outputs.original_filename }}"
+            git commit -m "📄 Add direct file ${{ steps.filenames.outputs.original_filename }}" || echo "Nothing to commit"
           fi
-          
-          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
           git push
